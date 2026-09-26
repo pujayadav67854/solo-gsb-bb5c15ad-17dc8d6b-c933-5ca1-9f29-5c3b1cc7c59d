@@ -163,7 +163,12 @@ curl -X POST http://localhost:8000/api/allocations/commit \
   （仓库测试含数千组 IPv4/IPv6 随机对照用例）；
 - 提交使用 SQLite `BEGIN IMMEDIATE` 单事务：版本检查 → 方案可用性复检
   （与保留/已分配子网逐一比对）→ 批量插入 → 版本自增。任一环节失败立即
-  回滚，保证“全成功或全不写入”，并发提交同一版本时**恰有一个**成功。
+  回滚，保证“全成功或全不写入”，并发提交同一版本时**恰有一个**成功；
+- 预演与池状态查询在**同一显式读事务**（同一 SQLite 快照）内读取池版本
+  与子网清单，并发提交不可能插入两次查询之间，响应不会出现
+  “旧版本配新占用集”的错位；
+- 提交响应的版本与分配结果在**本次写事务内**读回（写锁保证其间无其它
+  提交落库），不会把另一笔并发提交后的版本与空闲网段当作本次结果。
 
 ---
 
@@ -180,7 +185,12 @@ DB_PATH=./cidr_pool.db PARENT_CIDR=10.0.0.0/16 \
 ```bash
 python3 -m tests.test_allocator_bruteforce   # 4000 组 IPv4 暴力对照
 python3 -m tests.test_api                    # 接口端到端 + 并发原子性
+python3 -m tests.test_concurrency            # 并发交错回归（读快照 / 提交响应绑定）
 ```
+
+`tests/test_concurrency.py` 通过连接代理在受控时机注入并发提交，确定性地
+复现并回归两类竞态：读取版本与子网之间被插入提交（快照错位）、提交落库后
+读到其它事务的状态（响应错位）。
 
 ## 项目结构
 
@@ -193,6 +203,7 @@ app/
 tests/
   test_allocator_bruteforce.py
   test_api.py
+  test_concurrency.py
 Dockerfile
 docker-compose.yml
 requirements.txt

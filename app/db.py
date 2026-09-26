@@ -4,8 +4,11 @@
 ========
 * 数据库以 WAL 模式打开；
 * 每个请求使用独立短连接（check_same_thread=False 仅为线程兼容性）；
+* 读取接口（池状态 / 预演）在显式读事务内完成“版本 + 子网”两次查询，
+  二者始终来自同一 SQLite 快照，并发提交不可能插入两次查询之间；
 * 提交接口在单条 ``BEGIN IMMEDIATE`` 事务内完成“版本检查 + 方案可用性
-  复检 + 插入 + 版本自增”，任何一步失败即整体回滚，绝不部分分配。
+  复检 + 插入 + 版本自增”，并在提交前于同一事务内读回版本与分配结果，
+  响应只绑定本次写事务；任何一步失败即整体回滚，绝不部分分配。
 """
 from __future__ import annotations
 
@@ -43,6 +46,22 @@ class PoolState:
 
 class ConflictError(Exception):
     """提交冲突：池版本已变化，或方案在当前池状态下不再可用。"""
+
+
+def _state_from_rows(meta: sqlite3.Row, rows: list[sqlite3.Row]) -> PoolState:
+    """由同一事务内读出的 pool_meta 行与 subnets 行构建池状态。"""
+    parent = ipaddress.ip_network(meta["parent_cidr"], strict=True)
+    reserved = tuple(
+        ipaddress.ip_network(r["cidr"], strict=True)
+        for r in rows
+        if r["kind"] == "reserved"
+    )
+    allocated = tuple(
+        ipaddress.ip_network(r["cidr"], strict=True)
+        for r in rows
+        if r["kind"] == "allocated"
+    )
+    return PoolState(parent, meta["version"], reserved, allocated)
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -99,24 +118,27 @@ class Database:
 
     def get_state(self) -> PoolState:
         with self._conn() as conn:
+            return self._read_state(conn)
+
+    @staticmethod
+    def _read_state(conn: sqlite3.Connection) -> PoolState:
+        """在单个显式读事务（同一 SQLite 快照）内读取版本与子网。
+
+        若不开启显式事务，每条 SELECT 各自独立快照，并发提交可能插入
+        两次查询之间，导致“旧版本 + 新占用集”的错位状态。
+        """
+        conn.execute("BEGIN")
+        try:
             meta = conn.execute(
                 "SELECT parent_cidr, version FROM pool_meta WHERE id = 1"
             ).fetchone()
             rows = conn.execute(
                 "SELECT cidr, kind FROM subnets ORDER BY cidr"
             ).fetchall()
-        parent = ipaddress.ip_network(meta["parent_cidr"], strict=True)
-        reserved = tuple(
-            ipaddress.ip_network(r["cidr"], strict=True)
-            for r in rows
-            if r["kind"] == "reserved"
-        )
-        allocated = tuple(
-            ipaddress.ip_network(r["cidr"], strict=True)
-            for r in rows
-            if r["kind"] == "allocated"
-        )
-        return PoolState(parent, meta["version"], reserved, allocated)
+        finally:
+            # 只读事务：回滚即释放快照，与 COMMIT 等价且不会产生写。
+            conn.rollback()
+        return _state_from_rows(meta, rows)
 
     # -- 原子提交 ----------------------------------------------------------
 
@@ -182,13 +204,21 @@ class Database:
                 conn.execute(
                     "UPDATE pool_meta SET version = version + 1 WHERE id = 1"
                 )
+                # 关键：在同一写事务内读回版本与子网。写锁保证此刻不会有
+                # 其它提交插入，响应严格绑定本次事务的分配结果。
+                meta = conn.execute(
+                    "SELECT parent_cidr, version FROM pool_meta WHERE id = 1"
+                ).fetchone()
+                rows = conn.execute(
+                    "SELECT cidr, kind FROM subnets ORDER BY cidr"
+                ).fetchall()
                 conn.commit()
             except ConflictError:
                 raise
             except sqlite3.Error as exc:
                 conn.rollback()
                 raise ConflictError(f"commit failed: {exc}") from exc
-        return self.get_state()
+        return _state_from_rows(meta, rows)
 
 
 def _assert_disjoint(networks: tuple[ipaddress._BaseNetwork, ...]) -> None:
