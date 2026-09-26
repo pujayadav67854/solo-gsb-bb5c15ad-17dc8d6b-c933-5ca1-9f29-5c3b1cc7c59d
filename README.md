@@ -161,9 +161,16 @@ curl -X POST http://localhost:8000/api/allocations/commit \
   通过“节点几何 + 请求前缀多重集”的结构化记忆化与等前缀对称剪枝，
   穷举全部可行划分后比较目标函数，因此结果与完全暴力枚举一致
   （仓库测试含数千组 IPv4/IPv6 随机对照用例）；
+- 预演与池状态查询在**同一条 SQLite 读事务（WAL 快照）**内读取池版本
+  与子网：两次查询之间即使有并发提交落库，返回的版本与占用集也必然
+  属于同一快照，不会拼出“旧版本 + 新占用集”的错位状态；
 - 提交使用 SQLite `BEGIN IMMEDIATE` 单事务：版本检查 → 方案可用性复检
   （与保留/已分配子网逐一比对）→ 批量插入 → 版本自增。任一环节失败立即
-  回滚，保证“全成功或全不写入”，并发提交同一版本时**恰有一个**成功。
+  回滚，保证“全成功或全不写入”，并发提交同一版本时**恰有一个**成功；
+- 提交响应中的版本、已分配子网与空闲网段在**本次写事务内部**读取，
+  严格绑定本次提交；不会在提交后另开连接而混入其它并发提交的结果。
+  （`tests/test_concurrency.py` 用可控的并发交错对以上两条读取不变量
+  做了回归覆盖。）
 
 ---
 
@@ -179,7 +186,8 @@ DB_PATH=./cidr_pool.db PARENT_CIDR=10.0.0.0/16 \
 
 ```bash
 python3 -m tests.test_allocator_bruteforce   # 4000 组 IPv4 暴力对照
-python3 -m tests.test_api                    # 接口端到端 + 并发原子性
+python3 -m tests.test_api                    # 接口端到端 + 冲突/原子性
+python3 -m tests.test_concurrency            # 并发交错回归：快照读取与提交响应绑定
 ```
 
 ## 项目结构
@@ -192,7 +200,9 @@ app/
   main.py        # FastAPI 路由与请求/响应模型
 tests/
   test_allocator_bruteforce.py
+  test_dense_reserved.py
   test_api.py
+  test_concurrency.py
 Dockerfile
 docker-compose.yml
 requirements.txt

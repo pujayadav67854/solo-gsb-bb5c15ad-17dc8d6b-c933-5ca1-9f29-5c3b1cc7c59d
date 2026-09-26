@@ -4,8 +4,13 @@
 ========
 * 数据库以 WAL 模式打开；
 * 每个请求使用独立短连接（check_same_thread=False 仅为线程兼容性）；
+* 读取（池状态 / 预演）在单条 ``BEGIN`` 读事务内读取版本与子网，
+  整个查询基于同一 SQLite 快照，不会拼出“旧版本 + 新占用集”的
+  错位状态；
 * 提交接口在单条 ``BEGIN IMMEDIATE`` 事务内完成“版本检查 + 方案可用性
-  复检 + 插入 + 版本自增”，任何一步失败即整体回滚，绝不部分分配。
+  复检 + 插入 + 版本自增”，任何一步失败即整体回滚，绝不部分分配；
+  提交响应使用的版本与分配结果同样取自该写事务内部，不会混入其它
+  并发提交之后的状态。
 """
 from __future__ import annotations
 
@@ -55,6 +60,14 @@ def _connect(db_path: str) -> sqlite3.Connection:
 
 
 class Database:
+    # --- 测试钩子（生产环境默认为空操作）--------------------------------
+    # 并发回归测试通过替换这两个钩子来精确控制读写事务的交错时刻：
+    # _after_meta_select: 读事务内版本查询完成、子网查询开始之前；
+    # _after_commit:      写事务 COMMIT 完成之后（结果状态已在提交前
+    #                     于同一事务内读取，不受交错影响）。
+    _after_meta_select = staticmethod(lambda conn: None)
+    _after_commit = staticmethod(lambda conn: None)
+
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._db_path = settings.db_path
@@ -97,14 +110,24 @@ class Database:
 
     # -- 读取 --------------------------------------------------------------
 
-    def get_state(self) -> PoolState:
-        with self._conn() as conn:
-            meta = conn.execute(
-                "SELECT parent_cidr, version FROM pool_meta WHERE id = 1"
-            ).fetchone()
-            rows = conn.execute(
-                "SELECT cidr, kind FROM subnets ORDER BY cidr"
-            ).fetchall()
+    @staticmethod
+    def _load_state(
+        conn: sqlite3.Connection, between_reads=None
+    ) -> PoolState:
+        """在**当前事务的快照**内读取版本与全部子网并组装 PoolState。
+
+        调用方必须已开启事务（``BEGIN`` / ``BEGIN IMMEDIATE``），保证
+        版本与子网来自同一快照、写入对自身连接可见。``between_reads``
+        为测试钩子，在两次查询之间调用。
+        """
+        meta = conn.execute(
+            "SELECT parent_cidr, version FROM pool_meta WHERE id = 1"
+        ).fetchone()
+        if between_reads is not None:
+            between_reads(conn)
+        rows = conn.execute(
+            "SELECT cidr, kind FROM subnets ORDER BY cidr"
+        ).fetchall()
         parent = ipaddress.ip_network(meta["parent_cidr"], strict=True)
         reserved = tuple(
             ipaddress.ip_network(r["cidr"], strict=True)
@@ -118,6 +141,19 @@ class Database:
         )
         return PoolState(parent, meta["version"], reserved, allocated)
 
+    def get_state(self) -> PoolState:
+        """读取池状态。
+
+        版本与子网在同一条读事务内获取：SQLite WAL 下 ``BEGIN`` 后
+        事务固定在开启时的快照，两条查询之间即使有并发提交落库，也
+        不会返回“旧版本配新占用集”的错位结果。
+        """
+        with self._conn() as conn:
+            conn.execute("BEGIN")
+            state = self._load_state(conn, self._after_meta_select)
+            conn.commit()
+        return state
+
     # -- 原子提交 ----------------------------------------------------------
 
     def commit_plan(
@@ -125,7 +161,12 @@ class Database:
         expected_version: int,
         networks: tuple[ipaddress._BaseNetwork, ...],
     ) -> PoolState:
-        """在版本未变且方案仍可用时原子落库，否则抛 ConflictError。"""
+        """在版本未变且方案仍可用时原子落库，否则抛 ConflictError。
+
+        返回的 PoolState 在**本次写事务内部**、插入与版本自增之后读取，
+        因此响应中的版本、占用集严格对应本次提交；不会在提交后另开
+        连接而读到其它并发提交的结果。
+        """
         cidr_strs = [str(net) for net in networks]
         with self._conn() as conn:
             try:
@@ -182,13 +223,20 @@ class Database:
                 conn.execute(
                     "UPDATE pool_meta SET version = version + 1 WHERE id = 1"
                 )
+                # 在同一写事务内读取提交后的状态：版本与占用集必然对应
+                # 本次写入（其它提交被写锁挡在事务之外）。
+                state = self._load_state(conn)
                 conn.commit()
+                # 测试钩子：COMMIT 完成之后。修复前的实现会在此刻另开
+                # 连接读取状态，另一笔提交可能恰好落库；修复后结果已在
+                # 本事务内确定，钩子不再能造成版本/内容错位。
+                self._after_commit(conn)
             except ConflictError:
                 raise
             except sqlite3.Error as exc:
                 conn.rollback()
                 raise ConflictError(f"commit failed: {exc}") from exc
-        return self.get_state()
+        return state
 
 
 def _assert_disjoint(networks: tuple[ipaddress._BaseNetwork, ...]) -> None:
